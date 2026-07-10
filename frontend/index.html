@@ -658,21 +658,35 @@
         // === ANALYTICS ===
         function renderAnalytics() {
             const content = document.getElementById('analyticsContent');
-            if (!allBonds.length) { content.innerHTML = '<div class="loading">Нет данных</div>'; return; }
+            const portfolio = getPortfolio();
+
+            if (!portfolio.length) {
+                content.innerHTML = `<div class="portfolio-empty">
+                    <h3>Нет облигаций в портфеле</h3>
+                    <p>Добавь облигации из таблицы или календаря кнопкой "+",然后 аналитика покажет расчёт доходности с налогом и без</p>
+                </div>`;
+                return;
+            }
 
             const tax = 0.13;
-            const bonds = allBonds.filter(b => b.yield_percent > 0);
+            const bonds = portfolio.filter(b => b.yield_percent > 0);
 
             const avgYield = bonds.length ? (bonds.reduce((s,b) => s + b.yield_percent, 0) / bonds.length).toFixed(2) : 0;
             const avgYieldTax = (avgYield * (1 - tax)).toFixed(2);
+            const totalCoupon = bonds.reduce((s,b) => s + (b.coupon_value || 0), 0);
+            const totalCouponTax = (totalCoupon * (1 - tax)).toFixed(2);
+            const totalValue = bonds.reduce((s,b) => s + (b.price || 0) * (b.face_value || 1000) / 100, 0);
+            const totalIncome = bonds.reduce((s,b) => s + (b.annual_coupon || 0), 0);
+            const totalIncomeTax = (totalIncome * (1 - tax)).toFixed(0);
 
             const byFreq = {};
             bonds.forEach(b => {
                 const f = b.coupon_freq || 'Неизвестно';
-                if (!byFreq[f]) byFreq[f] = { count: 0, totalYield: 0, totalYieldTax: 0 };
+                if (!byFreq[f]) byFreq[f] = { count: 0, totalYield: 0, totalYieldTax: 0, totalCoupon: 0 };
                 byFreq[f].count++;
                 byFreq[f].totalYield += b.yield_percent;
                 byFreq[f].totalYieldTax += b.yield_percent * (1 - tax);
+                byFreq[f].totalCoupon += b.coupon_value || 0;
             });
 
             const byRating = {};
@@ -684,23 +698,25 @@
                 byRating[r].totalYieldTax += b.yield_percent * (1 - tax);
             });
 
-            const top10 = [...bonds].sort((a,b) => b.yield_percent - a.yield_percent).slice(0, 10);
-
             content.innerHTML = `
                 <div class="stats-row">
+                    <div class="stat-card">
+                        <h3>Облигаций в портфеле</h3>
+                        <div class="value">${bonds.length}</div>
+                    </div>
                     <div class="stat-card">
                         <h3>Средняя доходность</h3>
                         <div class="value" style="color:#3fb950">${avgYield}%</div>
                         <div style="font-size:12px;color:#8b949e;margin-top:4px">После налога 13%: <strong style="color:#58a6ff">${avgYieldTax}%</strong></div>
                     </div>
                     <div class="stat-card">
-                        <h3>Облигаций проанализировано</h3>
-                        <div class="value">${bonds.length}</div>
+                        <h3>Стоимость портфеля</h3>
+                        <div class="value">${totalValue.toLocaleString()} ₽</div>
                     </div>
                     <div class="stat-card">
-                        <h3>Ставка НДФЛ</h3>
-                        <div class="value">13%</div>
-                        <div style="font-size:11px;color:#8b949e;margin-top:4px">Стандартная ставка</div>
+                        <h3>Годовой доход</h3>
+                        <div class="value" style="color:#3fb950">${totalIncome.toLocaleString()} ₽</div>
+                        <div style="font-size:12px;color:#8b949e;margin-top:4px">После налога: <strong style="color:#58a6ff">${totalIncomeTax} ₽</strong></div>
                     </div>
                 </div>
 
@@ -763,7 +779,7 @@
                     </table>
                 </div>
 
-                <h3 style="margin:20px 0 12px;font-size:16px">Топ-10 по доходности</h3>
+                <h3 style="margin:20px 0 12px;font-size:16px">Все облигации портфеля</h3>
                 <div class="table-container">
                     <table>
                         <thead>
@@ -773,12 +789,13 @@
                                 <th>Доходность</th>
                                 <th>После налога</th>
                                 <th>Купон %</th>
+                                <th>Купон (₽)</th>
                                 <th>Периодичность</th>
                                 <th>Рейтинг</th>
                             </tr>
                         </thead>
                         <tbody>
-                            ${top10.map(b => {
+                            ${bonds.map(b => {
                                 const afterTax = (b.yield_percent * (1 - tax)).toFixed(2);
                                 const rc = (b.rating||'').includes('AAA') ? 'rating-aaa' : (b.rating||'').startsWith('A') ? 'rating-a' : (b.rating||'').includes('BBB') ? 'rating-bbb' : 'rating-bb';
                                 return `<tr>
@@ -787,6 +804,7 @@
                                     <td class="positive">${b.yield_percent.toFixed(2)}%</td>
                                     <td style="color:#58a6ff">${afterTax}%</td>
                                     <td>${b.coupon_percent ? b.coupon_percent.toFixed(2)+'%' : '—'}</td>
+                                    <td>${b.coupon_value ? b.coupon_value.toFixed(2) : '—'}</td>
                                     <td><span class="type-badge">${b.coupon_freq || '—'}</span></td>
                                     <td><span class="rating-badge ${rc}">${b.rating || '—'}</span></td>
                                 </tr>`;
