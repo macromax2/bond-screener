@@ -190,6 +190,7 @@
     <div class="tabs">
         <div class="tab active" onclick="switchTab('table')">Таблица <span class="count-badge" id="countBadge">0</span></div>
         <div class="tab" onclick="switchTab('calendar')">Календарь купонов</div>
+        <div class="tab" onclick="switchTab('analytics')">Аналитика</div>
         <div class="tab" onclick="switchTab('portfolio')">Мой портфель <span class="count-badge" id="portfolioBadge">0</span></div>
     </div>
 
@@ -224,6 +225,10 @@
             <div class="calendar-grid" id="calendarGrid">
                 <div class="loading">Загрузка...</div>
             </div>
+        </div>
+
+        <div id="analyticsView" style="display:none">
+            <div id="analyticsContent"></div>
         </div>
 
         <div id="portfolioView" style="display:none">
@@ -432,11 +437,13 @@
                 t.classList.toggle('active',
                     (tab === 'table' && txt.includes('таблиц')) ||
                     (tab === 'calendar' && txt.includes('календ')) ||
+                    (tab === 'analytics' && txt.includes('аналит')) ||
                     (tab === 'portfolio' && txt.includes('портфел'))
                 );
             });
             document.getElementById('tableView').style.display = tab === 'table' ? 'block' : 'none';
             document.getElementById('calendarView').style.display = tab === 'calendar' ? 'block' : 'none';
+            document.getElementById('analyticsView').style.display = tab === 'analytics' ? 'block' : 'none';
             document.getElementById('portfolioView').style.display = tab === 'portfolio' ? 'block' : 'none';
         }
 
@@ -578,6 +585,7 @@
             event.target.classList.add('active');
             switchTabDirect(tab);
             if (tab === 'calendar') loadCalendar();
+            if (tab === 'analytics') renderAnalytics();
             if (tab === 'portfolio') renderPortfolio();
         }
 
@@ -645,6 +653,148 @@
             const isins = portfolio.map(p => `${p.isin}\t${p.name}\t${p.rating}\t${p.yield_percent}%`).join('\n');
             const header = 'ISIN\tНазвание\tРейтинг\tДоходность\n';
             navigator.clipboard.writeText(header + isins).then(() => alert('ISIN скопированы в буфер!'));
+        }
+
+        // === ANALYTICS ===
+        function renderAnalytics() {
+            const content = document.getElementById('analyticsContent');
+            if (!allBonds.length) { content.innerHTML = '<div class="loading">Нет данных</div>'; return; }
+
+            const tax = 0.13;
+            const bonds = allBonds.filter(b => b.yield_percent > 0);
+
+            const avgYield = bonds.length ? (bonds.reduce((s,b) => s + b.yield_percent, 0) / bonds.length).toFixed(2) : 0;
+            const avgYieldTax = (avgYield * (1 - tax)).toFixed(2);
+
+            const byFreq = {};
+            bonds.forEach(b => {
+                const f = b.coupon_freq || 'Неизвестно';
+                if (!byFreq[f]) byFreq[f] = { count: 0, totalYield: 0, totalYieldTax: 0 };
+                byFreq[f].count++;
+                byFreq[f].totalYield += b.yield_percent;
+                byFreq[f].totalYieldTax += b.yield_percent * (1 - tax);
+            });
+
+            const byRating = {};
+            bonds.forEach(b => {
+                const r = b.rating || 'Неизвестно';
+                if (!byRating[r]) byRating[r] = { count: 0, totalYield: 0, totalYieldTax: 0 };
+                byRating[r].count++;
+                byRating[r].totalYield += b.yield_percent;
+                byRating[r].totalYieldTax += b.yield_percent * (1 - tax);
+            });
+
+            const top10 = [...bonds].sort((a,b) => b.yield_percent - a.yield_percent).slice(0, 10);
+
+            content.innerHTML = `
+                <div class="stats-row">
+                    <div class="stat-card">
+                        <h3>Средняя доходность</h3>
+                        <div class="value" style="color:#3fb950">${avgYield}%</div>
+                        <div style="font-size:12px;color:#8b949e;margin-top:4px">После налога 13%: <strong style="color:#58a6ff">${avgYieldTax}%</strong></div>
+                    </div>
+                    <div class="stat-card">
+                        <h3>Облигаций проанализировано</h3>
+                        <div class="value">${bonds.length}</div>
+                    </div>
+                    <div class="stat-card">
+                        <h3>Ставка НДФЛ</h3>
+                        <div class="value">13%</div>
+                        <div style="font-size:11px;color:#8b949e;margin-top:4px">Стандартная ставка</div>
+                    </div>
+                </div>
+
+                <h3 style="margin:20px 0 12px;font-size:16px">Доходность по периодичности купонов</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Периодичность</th>
+                                <th>Кол-во</th>
+                                <th>Средняя дох. (без налога)</th>
+                                <th>Средняя дох. (с налогом 13%)</th>
+                                <th>Потеря на налог</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${Object.entries(byFreq).map(([k,v]) => {
+                                const avg = (v.totalYield / v.count).toFixed(2);
+                                const avgT = (v.totalYieldTax / v.count).toFixed(2);
+                                const loss = (avg - avgT).toFixed(2);
+                                return `<tr>
+                                    <td><span class="type-badge">${k}</span></td>
+                                    <td>${v.count}</td>
+                                    <td class="positive">${avg}%</td>
+                                    <td style="color:#58a6ff">${avgT}%</td>
+                                    <td style="color:#f85149">-${loss}%</td>
+                                </tr>`;
+                            }).join('')}
+                        </tbody>
+                    </table>
+                </div>
+
+                <h3 style="margin:20px 0 12px;font-size:16px">Доходность по рейтингам</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Рейтинг</th>
+                                <th>Кол-во</th>
+                                <th>Средняя дох. (без налога)</th>
+                                <th>Средняя дох. (с налогом 13%)</th>
+                                <th>Потеря на налог</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${Object.entries(byRating).sort((a,b) => b[1].totalYield/b[1].count - a[1].totalYield/a[1].count).map(([k,v]) => {
+                                const avg = (v.totalYield / v.count).toFixed(2);
+                                const avgT = (v.totalYieldTax / v.count).toFixed(2);
+                                const loss = (avg - avgT).toFixed(2);
+                                const rc = k.includes('AAA') ? 'rating-aaa' : k.startsWith('A') ? 'rating-a' : k.includes('BBB') ? 'rating-bbb' : 'rating-bb';
+                                return `<tr>
+                                    <td><span class="rating-badge ${rc}">${k}</span></td>
+                                    <td>${v.count}</td>
+                                    <td class="positive">${avg}%</td>
+                                    <td style="color:#58a6ff">${avgT}%</td>
+                                    <td style="color:#f85149">-${loss}%</td>
+                                </tr>`;
+                            }).join('')}
+                        </tbody>
+                    </table>
+                </div>
+
+                <h3 style="margin:20px 0 12px;font-size:16px">Топ-10 по доходности</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Название</th>
+                                <th>ISIN</th>
+                                <th>Доходность</th>
+                                <th>После налога</th>
+                                <th>Купон %</th>
+                                <th>Периодичность</th>
+                                <th>Рейтинг</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${top10.map(b => {
+                                const afterTax = (b.yield_percent * (1 - tax)).toFixed(2);
+                                const rc = (b.rating||'').includes('AAA') ? 'rating-aaa' : (b.rating||'').startsWith('A') ? 'rating-a' : (b.rating||'').includes('BBB') ? 'rating-bbb' : 'rating-bb';
+                                return `<tr>
+                                    <td>${b.name}</td>
+                                    <td><span class="isin-code">${b.isin || '—'}</span></td>
+                                    <td class="positive">${b.yield_percent.toFixed(2)}%</td>
+                                    <td style="color:#58a6ff">${afterTax}%</td>
+                                    <td>${b.coupon_percent ? b.coupon_percent.toFixed(2)+'%' : '—'}</td>
+                                    <td><span class="type-badge">${b.coupon_freq || '—'}</span></td>
+                                    <td><span class="rating-badge ${rc}">${b.rating || '—'}</span></td>
+                                </tr>`;
+                            }).join('')}
+                        </tbody>
+                    </table>
+                </div>
+            `;
         }
 
         function renderPortfolio() {
