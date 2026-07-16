@@ -1,25 +1,38 @@
-import sqlite3
+import sys
+import os
+sys.path.insert(0, os.path.dirname(__file__))
+
+import psycopg2
+import psycopg2.extras
 import urllib.request
 import json
 import threading
+import hashlib
+import hmac
+import secrets
 from datetime import datetime, timedelta
 from pathlib import Path
 from contextlib import contextmanager
 
-from fastapi import FastAPI
+import bcrypt
+import jwt
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from typing import Optional
 
-app = FastAPI(title="Bond Screener", version="4.0.0")
+app = FastAPI(title="BondPulse", version="7.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
-DB_PATH = Path(__file__).parent / "bonds.db"
 
-import os
-if os.environ.get("RENDER"):
-    DB_PATH = Path("/tmp/bonds.db")
-    FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
+PG_DSN = os.environ.get("DATABASE_URL", "dbname=bond_screener")
+JWT_SECRET = os.environ.get("JWT_SECRET", secrets.token_hex(32))
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRY_HOURS = 72
+ENCRYPT_SALT = os.environ.get("ENCRYPT_SALT", "bond-screener-salt-v1")
 
 BOARDS = ["TQOB", "TQCB", "TQNO", "TQOV", "TQOS", "TQNB"]
 MOEX_BASE = "https://iss.moex.com/iss/engines/stock/markets/bonds/boards/{board}/securities.json"
@@ -28,34 +41,119 @@ sync_lock = threading.Lock()
 last_sync = {"time": None, "count": 0, "boards": {}}
 
 
+# === ENCRYPTION ===
+def _derive_key(password: str) -> bytes:
+    return hashlib.pbkdf2_hmac('sha256', password.encode(), ENCRYPT_SALT.encode(), 100000)
+
+def encrypt_data(data: str, password: str) -> str:
+    key = _derive_key(password)
+    iv = os.urandom(16)
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
+    pad_len = 16 - len(data.encode()) % 16
+    padded = data.encode() + bytes([pad_len] * pad_len)
+    ct = cipher.encryptor().update(padded) + cipher.encryptor().finalize()
+    return (iv + ct).hex()
+
+def decrypt_data(hex_data: str, password: str) -> str:
+    key = _derive_key(password)
+    raw = bytes.fromhex(hex_data)
+    iv, ct = raw[:16], raw[16:]
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
+    pt = cipher.decryptor().update(ct) + cipher.decryptor().finalize()
+    pad_len = pt[-1]
+    return pt[:-pad_len].decode()
+
+
+# === AUTH ===
+class UserRegister(BaseModel):
+    email: str
+    password: str
+    name: Optional[str] = ""
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+def verify_password(password: str, hashed: str) -> bool:
+    return bcrypt.checkpw(password.encode(), hashed.encode())
+
+def create_token(user_id: int, email: str) -> str:
+    payload = {
+        "user_id": user_id,
+        "email": email,
+        "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRY_HOURS)
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def get_current_user(authorization: str = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Необходима авторизация")
+    token = authorization.split(" ")[1]
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return {"user_id": payload["user_id"], "email": payload["email"]}
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Токен истёк")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Неверный токен")
+
+
 @contextmanager
 def get_db():
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(PG_DSN)
+    conn.autocommit = False
     try:
         yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
 
 def init_db():
     with get_db() as conn:
-        conn.execute("""
+        cur = conn.cursor()
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS bonds (
                 secid TEXT PRIMARY KEY, isin TEXT, name TEXT, short_name TEXT,
-                price REAL, yield_percent REAL, coupon_percent REAL, coupon_value REAL,
-                annual_coupon REAL, face_value REAL, mat_date TEXT, next_coupon TEXT,
+                price DOUBLE PRECISION, yield_percent DOUBLE PRECISION, coupon_percent DOUBLE PRECISION, coupon_value DOUBLE PRECISION,
+                annual_coupon DOUBLE PRECISION, face_value DOUBLE PRECISION, mat_date TEXT, next_coupon TEXT,
                 coupon_period INTEGER, days_to_mat INTEGER, bond_type TEXT, board TEXT,
-                emitent TEXT, rating TEXT, coupon_freq TEXT, volume REAL, trades INTEGER, synced_at TEXT
+                emitent TEXT, rating TEXT, coupon_freq TEXT, volume DOUBLE PRECISION, trades INTEGER, synced_at TEXT
             )
         """)
-        conn.execute("""
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS sync_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 synced_at TEXT, bonds_count INTEGER, boards_data TEXT, status TEXT
             )
         """)
-        conn.commit()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                name TEXT DEFAULT '',
+                plan TEXT DEFAULT 'free',
+                created_at TEXT DEFAULT NOW()::TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS user_portfolios (
+                user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                portfolio_data TEXT NOT NULL,
+                compare_data TEXT DEFAULT '[]',
+                updated_at TEXT DEFAULT NOW()::TEXT
+            )
+        """)
+        cur.close()
 
 
 def fetch_board(board: str) -> dict:
@@ -160,18 +258,27 @@ def sync_all():
 
     now = datetime.now().isoformat()
     with get_db() as conn:
-        conn.execute("DELETE FROM bonds")
-        conn.executemany("""
-            INSERT INTO bonds
-            (secid, isin, name, short_name, price, yield_percent, coupon_percent,
-             coupon_value, annual_coupon, face_value, mat_date, next_coupon,
-             coupon_period, days_to_mat, bond_type, board, emitent, rating, coupon_freq,
-             volume, trades, synced_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, all_bonds)
-        conn.execute("INSERT INTO sync_log (synced_at, bonds_count, boards_data, status) VALUES (?, ?, ?, ?)",
-                     (now, len(all_bonds), json.dumps(board_counts), "ok"))
-        conn.commit()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM bonds")
+        args_str = ",".join(
+            cur.mogrify(
+                "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", b
+            ).decode() for b in all_bonds
+        ) if all_bonds else None
+        if args_str:
+            cur.execute(f"""
+                INSERT INTO bonds
+                (secid, isin, name, short_name, price, yield_percent, coupon_percent,
+                 coupon_value, annual_coupon, face_value, mat_date, next_coupon,
+                 coupon_period, days_to_mat, bond_type, board, emitent, rating, coupon_freq,
+                 volume, trades, synced_at)
+                VALUES {args_str}
+            """)
+        cur.execute(
+            "INSERT INTO sync_log (synced_at, bonds_count, boards_data, status) VALUES (%s, %s, %s, %s)",
+            (now, len(all_bonds), json.dumps(board_counts), "ok")
+        )
+        cur.close()
 
     last_sync["time"] = now
     last_sync["count"] = len(all_bonds)
@@ -192,7 +299,10 @@ def sync_background():
 def startup():
     init_db()
     with get_db() as conn:
-        count = conn.execute("SELECT COUNT(*) FROM bonds").fetchone()[0]
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM bonds")
+        count = cur.fetchone()[0]
+        cur.close()
     if count == 0:
         print("[STARTUP] Empty DB, syncing from MOEX...")
         sync_background()
@@ -206,6 +316,86 @@ def auto_sync():
         import time
         time.sleep(3600)
         sync_background()
+
+
+# === AUTH ENDPOINTS ===
+@app.post("/api/auth/register")
+def register(user: UserRegister):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM users WHERE email = %s", (user.email,))
+        if cur.fetchone():
+            cur.close()
+            raise HTTPException(status_code=400, detail="Email уже зарегистрирован")
+        pw_hash = hash_password(user.password)
+        cur.execute(
+            "INSERT INTO users (email, password_hash, name) VALUES (%s, %s, %s) RETURNING id",
+            (user.email, pw_hash, user.name)
+        )
+        user_id = cur.fetchone()[0]
+        cur.execute(
+            "INSERT INTO user_portfolios (user_id, portfolio_data, compare_data) VALUES (%s, '[]', '[]')",
+            (user_id,)
+        )
+        cur.close()
+    token = create_token(user_id, user.email)
+    return {"token": token, "user": {"id": user_id, "email": user.email, "name": user.name, "plan": "free"}}
+
+
+@app.post("/api/auth/login")
+def login(user: UserLogin):
+    with get_db() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT id, email, password_hash, name, plan FROM users WHERE email = %s", (user.email,))
+        row = cur.fetchone()
+        cur.close()
+    if not row or not verify_password(user.password, row["password_hash"]):
+        raise HTTPException(status_code=401, detail="Неверный email или пароль")
+    token = create_token(row["id"], row["email"])
+    return {"token": token, "user": {"id": row["id"], "email": row["email"], "name": row["name"], "plan": row["plan"]}}
+
+
+@app.get("/api/auth/me")
+def get_me(current_user: dict = Depends(get_current_user)):
+    with get_db() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT id, email, name, plan FROM users WHERE id = %s", (current_user["user_id"],))
+        row = cur.fetchone()
+        cur.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    return dict(row)
+
+
+@app.post("/api/auth/portfolio/save")
+def save_user_portfolio(data: dict, current_user: dict = Depends(get_current_user)):
+    portfolio_json = json.dumps(data.get("portfolio", []))
+    compare_json = json.dumps(data.get("compare", []))
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE user_portfolios
+            SET portfolio_data = %s, compare_data = %s, updated_at = NOW()::TEXT
+            WHERE user_id = %s
+        """, (portfolio_json, compare_json, current_user["user_id"]))
+        cur.close()
+    return {"status": "ok"}
+
+
+@app.get("/api/auth/portfolio/load")
+def load_user_portfolio(current_user: dict = Depends(get_current_user)):
+    with get_db() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT portfolio_data, compare_data FROM user_portfolios WHERE user_id = %s",
+                    (current_user["user_id"],))
+        row = cur.fetchone()
+        cur.close()
+    if not row:
+        return {"portfolio": [], "compare": []}
+    return {
+        "portfolio": json.loads(row["portfolio_data"]),
+        "compare": json.loads(row["compare_data"])
+    }
 
 
 @app.post("/api/sync")
@@ -224,13 +414,21 @@ def sync_status():
     return last_sync
 
 
+@app.post("/api/ai/analyze")
+def ai_analyze(data: dict):
+    from ai_engine import analyze_portfolio
+    portfolio = data.get("portfolio", [])
+    result = analyze_portfolio(portfolio)
+    return result
+
+
 def _build_rating_condition(rating_str: str):
     ratings = [r.strip() for r in rating_str.split(",") if r.strip()]
     if not ratings:
         return None, []
-    likes = ["rating = ?" for _ in ratings]
+    placeholders = ",".join(["%s"] * len(ratings))
     exact = [f"{r} (RU)" for r in ratings]
-    return f"({' OR '.join(likes)})", exact
+    return f"rating IN ({placeholders})", exact
 
 
 @app.get("/api/bonds")
@@ -251,36 +449,39 @@ def get_bonds(
     conds, params = [], []
 
     if min_yield is not None:
-        conds.append("yield_percent >= ?"); params.append(min_yield)
+        conds.append("yield_percent >= %s"); params.append(min_yield)
     if max_yield is not None:
-        conds.append("yield_percent <= ?"); params.append(max_yield)
+        conds.append("yield_percent <= %s"); params.append(max_yield)
     if min_price is not None:
-        conds.append("price >= ?"); params.append(min_price)
+        conds.append("price >= %s"); params.append(min_price)
     if max_price is not None:
-        conds.append("price <= ?"); params.append(max_price)
+        conds.append("price <= %s"); params.append(max_price)
     if bond_type:
-        conds.append("bond_type LIKE ?"); params.append(f"%{bond_type}%")
+        conds.append("bond_type LIKE %s"); params.append(f"%{bond_type}%")
     if min_coupon is not None:
-        conds.append("coupon_percent >= ?"); params.append(min_coupon)
+        conds.append("coupon_percent >= %s"); params.append(min_coupon)
     if max_mat_days is not None:
-        conds.append("days_to_mat > 0 AND days_to_mat <= ?"); params.append(max_mat_days)
+        conds.append("days_to_mat > 0 AND days_to_mat <= %s"); params.append(max_mat_days)
     if search:
-        conds.append("(name LIKE ? OR isin LIKE ? OR secid LIKE ? OR emitent LIKE ?)")
+        conds.append("(name LIKE %s OR isin LIKE %s OR secid LIKE %s OR emitent LIKE %s)")
         s = f"%{search}%"; params.extend([s, s, s, s])
     if board:
-        conds.append("board = ?"); params.append(board)
+        conds.append("board = %s"); params.append(board)
     if coupon_freq:
-        conds.append("coupon_freq = ?"); params.append(coupon_freq)
+        conds.append("coupon_freq = %s"); params.append(coupon_freq)
     if rating:
         rc, rp = _build_rating_condition(rating)
         if rc:
             conds.append(rc); params.extend(rp)
 
-    where = " AND ".join(conds) if conds else "1=1"
+    where = " AND ".join(conds) if conds else "TRUE"
     sql = f"SELECT * FROM bonds WHERE {where} ORDER BY {sort_by} {order}"
 
     with get_db() as conn:
-        rows = conn.execute(sql, params).fetchall()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        cur.close()
     bonds = [dict(r) for r in rows]
 
     return {"bonds": bonds, "total": len(bonds), "updated": last_sync.get("time")}
@@ -289,7 +490,10 @@ def get_bonds(
 @app.get("/api/bonds/{secid}")
 def get_bond_detail(secid: str):
     with get_db() as conn:
-        row = conn.execute("SELECT * FROM bonds WHERE secid = ?", (secid,)).fetchone()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM bonds WHERE secid = %s", (secid,))
+        row = cur.fetchone()
+        cur.close()
     return dict(row) if row else {"error": "Not found"}
 
 
@@ -298,7 +502,7 @@ def get_coupon_calendar(months: int = 6, rating: str = None, board: str = None):
     conds, params = ["next_coupon != ''"], []
 
     if board:
-        conds.append("board = ?"); params.append(board)
+        conds.append("board = %s"); params.append(board)
     if rating:
         rc, rp = _build_rating_condition(rating)
         if rc:
@@ -306,10 +510,13 @@ def get_coupon_calendar(months: int = 6, rating: str = None, board: str = None):
 
     where = " AND ".join(conds)
     with get_db() as conn:
-        rows = conn.execute(
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
             f"SELECT secid, name, coupon_value, coupon_percent, next_coupon, rating, board FROM bonds WHERE {where}",
             params
-        ).fetchall()
+        )
+        rows = cur.fetchall()
+        cur.close()
 
     calendar = {}
     today = datetime.now()
@@ -350,34 +557,45 @@ def get_coupon_calendar(months: int = 6, rating: str = None, board: str = None):
 @app.get("/api/ratings")
 def get_ratings():
     with get_db() as conn:
-        rows = conn.execute("""
-            SELECT rating, COUNT(*) as count, ROUND(AVG(yield_percent), 2) as avg_yield
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT rating, COUNT(*) as count, ROUND(AVG(yield_percent)::numeric, 2) as avg_yield
             FROM bonds WHERE yield_percent > 0 GROUP BY rating ORDER BY avg_yield DESC
-        """).fetchall()
+        """)
+        rows = cur.fetchall()
+        cur.close()
     return {"ratings": [dict(r) for r in rows]}
 
 
 @app.get("/api/boards")
 def get_boards():
     with get_db() as conn:
-        rows = conn.execute("""
-            SELECT board, COUNT(*) as count, ROUND(AVG(yield_percent), 2) as avg_yield
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT board, COUNT(*) as count, ROUND(AVG(yield_percent)::numeric, 2) as avg_yield
             FROM bonds WHERE yield_percent > 0 GROUP BY board ORDER BY count DESC
-        """).fetchall()
+        """)
+        rows = cur.fetchall()
+        cur.close()
     return {"boards": [dict(r) for r in rows]}
 
 
 @app.get("/api/stats")
 def get_stats():
     with get_db() as conn:
-        row = conn.execute("""
-            SELECT COUNT(*) as total, ROUND(AVG(yield_percent), 2) as avg_yield,
-                   ROUND(MAX(yield_percent), 2) as max_yield, ROUND(MIN(yield_percent), 2) as min_yield,
-                   ROUND(AVG(price), 2) as avg_price
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT COUNT(*) as total, ROUND(AVG(yield_percent)::numeric, 2) as avg_yield,
+                   ROUND(MAX(yield_percent)::numeric, 2) as max_yield, ROUND(MIN(yield_percent)::numeric, 2) as min_yield,
+                   ROUND(AVG(price)::numeric, 2) as avg_price
             FROM bonds WHERE yield_percent > 0
-        """).fetchone()
-        by_board = conn.execute("SELECT board, COUNT(*) as count FROM bonds GROUP BY board").fetchall()
-        by_rating = conn.execute("SELECT rating, COUNT(*) as count FROM bonds GROUP BY rating ORDER BY rating").fetchall()
+        """)
+        row = cur.fetchone()
+        cur.execute("SELECT board, COUNT(*) as count FROM bonds GROUP BY board")
+        by_board = cur.fetchall()
+        cur.execute("SELECT rating, COUNT(*) as count FROM bonds GROUP BY rating ORDER BY rating")
+        by_rating = cur.fetchall()
+        cur.close()
     return {
         **dict(row),
         "by_board": {r["board"]: r["count"] for r in by_board},
@@ -388,13 +606,20 @@ def get_stats():
 @app.get("/api/history")
 def sync_history(limit: int = 20):
     with get_db() as conn:
-        rows = conn.execute("SELECT * FROM sync_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM sync_log ORDER BY id DESC LIMIT %s", (limit,))
+        rows = cur.fetchall()
+        cur.close()
     return {"history": [dict(r) for r in rows]}
 
 
 @app.get("/", response_class=HTMLResponse)
 def root():
     return FileResponse(FRONTEND_DIR / "index.html")
+
+
+app.mount("/css", StaticFiles(directory=str(FRONTEND_DIR / "css")), name="css")
+app.mount("/js", StaticFiles(directory=str(FRONTEND_DIR / "js")), name="js")
 
 
 if __name__ == "__main__":
